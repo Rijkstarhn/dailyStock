@@ -14,6 +14,16 @@ from tqdm import tqdm
 
 import google.generativeai as genai
 
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+
+import markdown as md_lib
+
 
 # -----------------------------
 # Config
@@ -26,29 +36,39 @@ COMPANIES = [
     {"ticker": "MSFT", "name": "Microsoft", "query": "Microsoft OR MSFT"},
 ]
 
-# Google News RSS (no API key). You can swap to other RSS sources easily.
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
 OUT_DIR = "reports"
 CACHE_DIR = "cache"
-MAX_ITEMS_PER_COMPANY = 30  # pull this many per company per run
+MAX_ITEMS_PER_COMPANY = 30
 
-# Light “reliability” heuristic: prefer mainstream domains if present.
 TRUSTED_DOMAIN_HINTS = [
     "reuters.com", "bloomberg.com", "wsj.com", "ft.com", "nytimes.com",
     "theverge.com", "techcrunch.com", "arstechnica.com",
     "sec.gov", "microsoft.com", "nvidia.com", "investor", "ir.",
 ]
 
-# Gemini config
-# export GEMINI_API_KEY="..."
-# export GEMINI_MODEL="gemini-1.5-flash"
+# Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-# Configure Gemini once (recommended)
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
+# Email (SMTP)
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+
+EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER)
+EMAIL_TO = os.getenv("EMAIL_TO", "")
+EMAIL_CC = os.getenv("EMAIL_CC", "")
+EMAIL_BCC = os.getenv("EMAIL_BCC", "")
+EMAIL_SUBJECT_PREFIX = os.getenv("EMAIL_SUBJECT_PREFIX", "[Daily Brief]")
+
+# Schedule
+SCHEDULE_HOUR = int(os.getenv("SCHEDULE_HOUR", "9"))
+SCHEDULE_MINUTE = int(os.getenv("SCHEDULE_MINUTE", "0"))
 
 
 # -----------------------------
@@ -57,7 +77,7 @@ if GEMINI_API_KEY:
 
 @dataclass
 class Article:
-    company: str          # ticker
+    company: str
     title: str
     link: str
     published_utc: Optional[dt.datetime]
@@ -73,8 +93,8 @@ class EventCluster:
     articles: List[Article]
     canonical_summary: str
     event_type: str
-    importance: int       # 1-5
-    confidence: int       # 1-5
+    importance: int
+    confidence: int
 
 
 # -----------------------------
@@ -127,6 +147,17 @@ def to_local_time_str(dt_utc: Optional[dt.datetime]) -> str:
     return local.strftime("%Y-%m-%d %H:%M %Z")
 
 
+def today_local_str() -> str:
+    return dt.datetime.now(tz=LOCAL_TZ).strftime("%Y-%m-%d")
+
+
+def parse_emails(csv: str) -> List[str]:
+    if not csv.strip():
+        return []
+    parts = [p.strip() for p in csv.split(",")]
+    return [p for p in parts if p]
+
+
 # -----------------------------
 # Retrieval
 # -----------------------------
@@ -148,7 +179,6 @@ def fetch_rss_articles(company: Dict[str, str]) -> List[Article]:
     for e in feed.entries[:MAX_ITEMS_PER_COMPANY]:
         title = getattr(e, "title", "").strip()
         link = getattr(e, "link", "").strip()
-
         if not title or not link:
             continue
 
@@ -221,13 +251,11 @@ def infer_importance(text: str, group: List[Article]) -> int:
     if any(k in t for k in ["launch", "release", "announce", "introduce"]):
         score = max(score, 3)
 
-    # More sources → higher confidence/importance
     if len(group) >= 3:
         score = max(score, 3)
     if len(group) >= 6:
         score = max(score, 4)
 
-    # trusted domains present
     if any(trust_score(a.link) == 2 for a in group):
         score = max(score, 3)
 
@@ -235,13 +263,6 @@ def infer_importance(text: str, group: List[Article]) -> int:
 
 
 def cluster_by_keywords(articles: List[Article]) -> List[EventCluster]:
-    """
-    MVP clustering:
-      - normalize title
-      - strip tickers/company words
-      - use signature = first 10 normalized tokens
-    Production should use embeddings + semantic clustering.
-    """
     buckets: Dict[str, List[Article]] = {}
 
     for a in articles:
@@ -255,7 +276,6 @@ def cluster_by_keywords(articles: List[Article]) -> List[EventCluster]:
     clusters: List[EventCluster] = []
     for k, group in buckets.items():
         company = group[0].company
-
         rep = sorted(group, key=lambda x: len(x.title), reverse=True)[0]
 
         snips: List[str] = []
@@ -271,7 +291,6 @@ def cluster_by_keywords(articles: List[Article]) -> List[EventCluster]:
                 seen_snip.add(s)
 
         canonical = " ".join(snips)[:900] if snips else ""
-
         event_type = infer_event_type(rep.title + " " + canonical)
         importance = infer_importance(rep.title + " " + canonical, group)
         confidence = 4 if len(group) >= 2 else 3
@@ -297,13 +316,10 @@ def cluster_by_keywords(articles: List[Article]) -> List[EventCluster]:
 
 
 # -----------------------------
-# LLM (optional) - Gemini
+# LLM - Gemini
 # -----------------------------
 
 def call_gemini(system: str, user: str) -> str:
-    """
-    Returns markdown text (may be empty on block/filters/errors).
-    """
     if not GEMINI_API_KEY:
         return ""
 
@@ -321,12 +337,10 @@ def call_gemini(system: str, user: str) -> str:
             },
         )
 
-        # response.text can be empty in some edge cases
         text = getattr(response, "text", None)
         if text:
             return text
 
-        # fallback: try candidates
         candidates = getattr(response, "candidates", None)
         if candidates:
             parts = []
@@ -342,15 +356,11 @@ def call_gemini(system: str, user: str) -> str:
                 return "\n".join(parts)
 
         return ""
-
     except Exception as e:
         return f"_Model call failed: {e}_"
 
 
 def llm_analyze_clusters(clusters: List[EventCluster]) -> str:
-    """
-    Build a single daily analysis section, grouped by company.
-    """
     if not GEMINI_API_KEY:
         return (
             "_LLM analysis disabled (GEMINI_API_KEY not set)._ \n\n"
@@ -418,9 +428,9 @@ def llm_analyze_clusters(clusters: List[EventCluster]) -> str:
 # -----------------------------
 
 def render_md(clusters: List[EventCluster], analysis_md: str) -> str:
-    today_local = dt.datetime.now(tz=LOCAL_TZ).strftime("%Y-%m-%d")
+    today = today_local_str()
     lines: List[str] = []
-    lines.append(f"# Daily News Brief — NVDA + MSFT — {today_local}\n")
+    lines.append(f"# Daily News Brief — NVDA + MSFT — {today}\n")
     lines.append("> Generated by demo agent: RSS retrieval → dedup → light clustering → (optional) LLM analysis.\n")
 
     lines.append("## Top Event Clusters\n")
@@ -445,11 +455,104 @@ def render_md(clusters: List[EventCluster], analysis_md: str) -> str:
     return "\n".join(lines)
 
 
+def md_to_html(markdown_text: str) -> str:
+    """
+    Convert Markdown to email-friendly HTML.
+    """
+    html_body = md_lib.markdown(
+        markdown_text,
+        extensions=["extra", "sane_lists", "tables", "toc"],
+        output_format="html5",
+    )
+
+    # Very simple inline CSS for email readability
+    style = """
+    <style>
+      body { font-family: Arial, sans-serif; line-height: 1.4; }
+      h1,h2,h3 { margin: 16px 0 8px; }
+      code, pre { background: #f6f8fa; padding: 2px 4px; border-radius: 4px; }
+      pre { padding: 12px; overflow-x: auto; }
+      a { color: #1a0dab; }
+      table { border-collapse: collapse; }
+      th, td { border: 1px solid #ddd; padding: 6px 8px; }
+    </style>
+    """
+    return f"<!doctype html><html><head>{style}</head><body>{html_body}</body></html>"
+
+
 # -----------------------------
-# Main
+# Email sending
 # -----------------------------
 
-def main() -> None:
+def validate_email_config() -> None:
+    missing = []
+    if not SMTP_HOST:
+        missing.append("SMTP_HOST")
+    if not SMTP_PORT:
+        missing.append("SMTP_PORT")
+    if not SMTP_USER:
+        missing.append("SMTP_USER")
+    if not SMTP_PASS:
+        missing.append("SMTP_PASS")
+    if not EMAIL_TO.strip():
+        missing.append("EMAIL_TO")
+    if missing:
+        raise RuntimeError(f"Missing email config env vars: {', '.join(missing)}")
+
+
+def send_email_report(subject: str, markdown_text: str, md_path: str) -> None:
+    validate_email_config()
+
+    to_list = parse_emails(EMAIL_TO)
+    cc_list = parse_emails(EMAIL_CC)
+    bcc_list = parse_emails(EMAIL_BCC)
+
+    # Email container
+    msg = MIMEMultipart("mixed")
+    msg["From"] = EMAIL_FROM or SMTP_USER
+    msg["To"] = ", ".join(to_list)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+    msg["Subject"] = subject
+
+    # Alternative part: plain text + HTML
+    alt = MIMEMultipart("alternative")
+    plain_text = (
+        "Daily report is attached as Markdown.\n\n"
+        "If your email client supports HTML, you should see a formatted version.\n"
+    )
+    alt.attach(MIMEText(plain_text, "plain", "utf-8"))
+
+    html = md_to_html(markdown_text)
+    alt.attach(MIMEText(html, "html", "utf-8"))
+
+    msg.attach(alt)
+
+    # Attach markdown file
+    with open(md_path, "rb") as f:
+        part = MIMEApplication(f.read(), _subtype="markdown")
+    filename = os.path.basename(md_path)
+    part.add_header("Content-Disposition", "attachment", filename=filename)
+    msg.attach(part)
+
+    # Send
+    recipients = to_list + cc_list + bcc_list
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, recipients, msg.as_string())
+
+
+# -----------------------------
+# Pipeline
+# -----------------------------
+
+def generate_report() -> str:
+    """
+    Returns the path to the generated .md file.
+    """
     ensure_dirs()
 
     all_articles: List[Article] = []
@@ -462,25 +565,75 @@ def main() -> None:
             print(f"[WARN] Failed to fetch {c['ticker']}: {e}")
 
     all_articles = simple_dedup(all_articles)
-
     all_articles.sort(
         key=lambda a: (a.published_utc or dt.datetime.min.replace(tzinfo=dt.timezone.utc)),
         reverse=True
     )
 
     clusters = cluster_by_keywords(all_articles)
-
     analysis_md = llm_analyze_clusters(clusters)
-
     report_md = render_md(clusters, analysis_md)
 
-    today_local = dt.datetime.now(tz=LOCAL_TZ).strftime("%Y-%m-%d")
-    out_path = os.path.join(OUT_DIR, f"{today_local}.md")
+    today = today_local_str()
+    out_path = os.path.join(OUT_DIR, f"{today}.md")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(report_md)
 
-    print(f"\n✅ Report written to: {out_path}")
+    print(f"✅ Report written to: {out_path}")
+    return out_path
 
+
+def run_once_send_email() -> None:
+    """
+    Generate report and email it.
+    """
+    md_path = generate_report()
+    with open(md_path, "r", encoding="utf-8") as f:
+        markdown_text = f.read()
+
+    subject = f"{EMAIL_SUBJECT_PREFIX} NVDA+MSFT — {today_local_str()}"
+    send_email_report(subject=subject, markdown_text=markdown_text, md_path=md_path)
+    print("✅ Email sent.")
+
+
+# -----------------------------
+# Scheduler
+# -----------------------------
+
+def start_scheduler() -> None:
+    """
+    Runs forever and triggers at 09:00 America/Los_Angeles daily.
+    """
+    scheduler = BlockingScheduler(timezone="America/Los_Angeles")
+
+    trigger = CronTrigger(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE)
+    scheduler.add_job(
+        run_once_send_email,
+        trigger=trigger,
+        id="daily_email_report",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+
+    now = dt.datetime.now(tz=LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
+    print(f"Scheduler started at {now}. Will send daily at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} {LOCAL_TZ.tzname(dt.datetime.now(tz=LOCAL_TZ))}.")
+    scheduler.start()
+
+
+# -----------------------------
+# Main
+# -----------------------------
 
 if __name__ == "__main__":
-    main()
+    # Two modes:
+    # 1) Run once now:
+    #    python agent.py --once
+    # 2) Run scheduler (default):
+    #    python agent.py
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--once":
+        run_once_send_email()
+    else:
+        start_scheduler()
